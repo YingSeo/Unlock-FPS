@@ -8,10 +8,9 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Prepare Project Files
+      - name: Prepare Project Structure
         shell: pwsh
         run: |
-          # 1. Đảm bảo file main.cpp luôn nằm đúng trong thư mục src/main.cpp
           if (!(Test-Path "src")) {
             New-Item -ItemType Directory -Path "src" | Out-Null
           }
@@ -19,47 +18,30 @@ jobs:
             Copy-Item "main.cpp" "src/main.cpp" -Force
           }
 
-          # 2. Lấy phiên bản Geode SDK ổn định mới nhất để không bị Outdated
-          $geodeVer = "4.4.0"
-          try {
-            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/geode-sdk/geode/releases/latest" -TimeoutSec 10
-            if ($rel.tag_name) {
-              $geodeVer = $rel.tag_name -replace '^v',''
-            }
-          } catch {
-            Write-Host "Using fallback Geode version: $geodeVer"
-          }
-
-          # 3. Tạo mod.json chuẩn UTF-8 không BOM
           $modJson = [ordered]@{
-            geode = $geodeVer
+            geode = "4.4.0"
             gd = @{
               win = "2.2081"
             }
             id = "yingseo.true480fps.unlocker"
-            name = "True 480+ FPS Apex Engine"
-            version = "v5.0.0"
+            name = "True 480+ FPS ZeroError Engine"
+            version = "v6.0.0"
             developer = "YingSeo"
-            description = "True 480+ FPS Floor, Win11 0.5ms Kernel Boost, Anti-Blur/Tear & Eclipse Synergy."
+            description = "True 480+ FPS Floor, Anti-Blur/Tear & Eclipse Synergy."
             "early-load" = $true
           } | ConvertTo-Json -Depth 10
           [System.IO.File]::WriteAllText("$PWD/mod.json", $modJson, (New-Object System.Text.UTF8Encoding($false)))
 
-          # 4. Tạo CMakeLists.txt chuẩn C++20 của Geode SDK
           $cmake = @(
             'cmake_minimum_required(VERSION 3.21)',
             'set(CMAKE_CXX_STANDARD 20)',
             'set(CMAKE_CXX_STANDARD_REQUIRED ON)',
-            'set(CMAKE_CXX_VISIBILITY_PRESET hidden)',
-            'project(True480FPSMod VERSION 5.0.0)',
+            'project(True480FPSMod VERSION 6.0.0)',
             'add_library(${PROJECT_NAME} SHARED src/main.cpp)',
             'if (NOT DEFINED ENV{GEODE_SDK})',
             '    message(FATAL_ERROR "Unable to find Geode SDK!")',
             'endif()',
             'add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)',
-            'if (WIN32)',
-            '    target_link_libraries(${PROJECT_NAME} PRIVATE opengl32 user32 gdi32)',
-            'endif()',
             'setup_geode_mod(${PROJECT_NAME})'
           ) -join "`n"
           [System.IO.File]::WriteAllText("$PWD/CMakeLists.txt", $cmake, (New-Object System.Text.UTF8Encoding($false)))
@@ -73,7 +55,7 @@ jobs:
       - name: Upload Geode Package
         uses: actions/upload-artifact@v4
         with:
-          name: True480PlusApexEngine-v5
+          name: True480FPS-ZeroError-v6
           path: |
             ${{ steps.build.outputs.build-output }}
             **/*.geode
