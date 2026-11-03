@@ -17,12 +17,13 @@ jobs:
     - name: Setup Geode CLI
       uses: geode-sdk/install-geode-cli@v1
 
-    - name: Build Mod Package
+    - name: Build Mod Package for Windows
       run: |
-        geode build --output build
+        geode package new --no-interaction || true
+        geode build --platform win
 
     - name: Upload Artifact (.geode file)
       uses: actions/upload-artifact@v4
       with:
-        name: UltraFPSBooster480
+        name: UltraFPSBooster480-Windows
         path: build/*.geode
