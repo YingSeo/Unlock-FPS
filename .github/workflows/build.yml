@@ -5,31 +5,84 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout Source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Auto-Sync Latest Geode SDK Version
+      - name: Auto-Fix Structure & Sync Latest Geode SDK
         shell: pwsh
         run: |
+          # 1. Tự động chuẩn hóa vị trí file src/main.cpp
+          if (!(Test-Path "src")) {
+            New-Item -ItemType Directory -Path "src" | Out-Null
+          }
+          if (Test-Path "main.cpp") {
+            Copy-Item "main.cpp" "src/main.cpp" -Force
+          }
+
+          # 2. Tự động lấy phiên bản Geode SDK & GD mới nhất để không bao giờ bị lỗi Outdated
+          $latestGeode = "4.4.0"
+          $gdWinVer = "2.2081"
           try {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/geode-sdk/geode/releases/latest"
-            $latest = $release.tag_name -replace '^v',''
-            if ($latest) {
-              Write-Host "Syncing mod.json to Geode SDK version: $latest"
-              $json = Get-Content mod.json -Raw | ConvertFrom-Json
-              $json.geode = $latest
-              $json | ConvertTo-Json -Depth 10 | Set-Content mod.json -Encoding UTF8
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/geode-sdk/geode/releases/latest"
+            if ($rel.tag_name) {
+              $latestGeode = $rel.tag_name -replace '^v',''
+            }
+            $loaderUrl = "https://raw.githubusercontent.com/geode-sdk/geode/$($rel.tag_name)/loader/mod.json"
+            $loaderMod = Invoke-RestMethod -Uri $loaderUrl
+            if ($loaderMod.gd -and $loaderMod.gd.win) {
+              $gdWinVer = $loaderMod.gd.win
             }
           } catch {
-            Write-Host "Using default Geode version from mod.json"
+            Write-Host "Fallback to default Geode version: $latestGeode"
           }
+
+          Write-Host "Synced Geode SDK: $latestGeode | GD Windows Target: $gdWinVer"
+
+          # 3. Tự động ghi file mod.json chuẩn UTF-8 không BOM
+          $modData = [ordered]@{
+            geode = $latestGeode
+            gd = @{
+              win = $gdWinVer
+            }
+            id = "yingseo.true480fps.unlocker"
+            name = "True 480+ FPS HyperEngine"
+            version = "v4.0.0"
+            developer = "YingSeo"
+            description = "True 480+ FPS Floor, Win11 0.5ms Kernel Boost, Anti-Blur/Tear & Eclipse Synergy."
+            "early-load" = $true
+          } | ConvertTo-Json -Depth 10
+          [System.IO.File]::WriteAllText("$PWD/mod.json", $modData, (New-Object System.Text.UTF8Encoding($false)))
+
+          # 4. Tự động ghi file CMakeLists.txt chuẩn C++23 mới nhất
+          $cmakeLines = @(
+            'cmake_minimum_required(VERSION 3.21)',
+            'set(CMAKE_CXX_STANDARD 23)',
+            'set(CMAKE_CXX_STANDARD_REQUIRED ON)',
+            'set(CMAKE_CXX_VISIBILITY_PRESET hidden)',
+            'project(True480FPSMod VERSION 4.0.0)',
+            'add_library(${PROJECT_NAME} SHARED src/main.cpp)',
+            'if (NOT DEFINED ENV{GEODE_SDK})',
+            '    message(FATAL_ERROR "Unable to find Geode SDK!")',
+            'endif()',
+            'add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)',
+            'if (WIN32)',
+            '    target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)',
+            '    target_link_libraries(${PROJECT_NAME} PRIVATE winmm avrt opengl32 dwmapi user32 gdi32)',
+            'endif()',
+            'setup_geode_mod(${PROJECT_NAME})'
+          ) -join "`n"
+          [System.IO.File]::WriteAllText("$PWD/CMakeLists.txt", $cmakeLines, (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Build Geode Mod
         id: build
         uses: geode-sdk/build-geode-mod@main
+        with:
+          combine: true
 
       - name: Upload Geode Package
         uses: actions/upload-artifact@v4
         with:
-          name: True480PlusHyperEngine
-          path: ${{ steps.build.outputs.build-output }}
+          name: True480PlusHyperEngine-v4
+          path: |
+            ${{ steps.build.outputs.build-output }}
+            **/*.geode
