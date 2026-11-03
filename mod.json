@@ -1,13 +1,12 @@
 {
-	"geode": "4.4.0",
-	"gd": {
-		"win": "*",
-		"android": "*",
-		"mac": "*"
-	},
-	"id": "dev.ultrabypass480",
-	"name": "Ultra FPS Booster 480+",
-	"version": "3.0.0",
-	"developer": "CustomMod",
-	"description": "v3.0: Khoa cung 480 FPS khong feedback loop, fix input latency cho Frame Perfect va tuong thich tuyet đối voi Mega Hack."
+    "geode": "4.3.0",
+    "gd": {
+        "win": "2.2081"
+    },
+    "id": "yingseo.true480fps.unlocker",
+    "name": "True 480+ FPS HyperEngine",
+    "version": "v3.0.0",
+    "developer": "YingSeo",
+    "description": "Minimum 480+ FPS Floor, Win11 0.5ms Kernel Boost, Anti-Blur/Tear & Eclipse Synergy.",
+    "early-load": true
 }
