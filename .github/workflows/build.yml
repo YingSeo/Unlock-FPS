@@ -19,9 +19,10 @@ jobs:
       with:
         cli-version: latest
 
-    - name: Build Mod for Windows
+    - name: Configure and Build Mod
       run: |
-        geode build --platform win
+        geode new --name "UltraFPSBooster480" --id "dev.ultrabypass480" --developer "CustomMod" --no-interaction || true
+        geode build --config Release
 
     - name: Upload Artifact (.geode file)
       uses: actions/upload-artifact@v4
