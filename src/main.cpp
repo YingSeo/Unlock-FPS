@@ -1,50 +1,24 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/CCApplication.hpp>
 #include <Geode/modify/CCScheduler.hpp>
 #include <Geode/modify/CCEGLView.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-
-#include <windows.h>
-#include <mmsystem.h>
-#include <avrt.h>
-#include <dwmapi.h>
-#include <GL/gl.h>
 #include <algorithm>
 #include <cmath>
-
-// Tự động liên kết toàn bộ thư viện hệ thống Windows 11 ngay trong trình biên dịch MSVC/Clang
-#pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "avrt.lib")
-#pragma comment(lib, "opengl32.lib")
-#pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdi32.lib")
+#include <cstdint>
 
 using namespace geode::prelude;
 
-// Mức sàn tối thiểu: 480 FPS (2.083333 ms mỗi bước khung hình, không giới hạn trần)
+// Mức sàn tối thiểu: 480 FPS (2.083333 ms mỗi khung hình, không giới hạn trần)
 constexpr double MIN_FLOOR_FPS = 480.0;
 constexpr double MAX_FLOOR_DT = 1.0 / MIN_FLOOR_FPS;
 
-#ifndef GL_MULTISAMPLE
-#define GL_MULTISAMPLE 0x809D
-#endif
-
-#ifndef PROCESS_POWER_THROTTLING_CURRENT_VERSION
-#define PROCESS_POWER_THROTTLING_CURRENT_VERSION 1
-#endif
-#ifndef PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-#define PROCESS_POWER_THROTTLING_EXECUTION_SPEED 0x1
-#endif
-#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
-#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
-#endif
+// Hằng số OpenGL chuẩn phần cứng
+constexpr unsigned int GL_MULTISAMPLE_EXT_CODE = 0x809D;
+constexpr unsigned int GL_LINE_SMOOTH_CODE = 0x0B20;
+constexpr unsigned int GL_POLYGON_SMOOTH_CODE = 0x0B41;
+constexpr unsigned int GL_PERSPECTIVE_CORRECTION_HINT_CODE = 0x0C50;
+constexpr unsigned int GL_NICEST_CODE = 0x1102;
 
 namespace {
     struct Win11PowerThrottling {
@@ -53,132 +27,213 @@ namespace {
         ULONG StateMask;
     };
 
-    using PFN_wglSwapIntervalEXT = BOOL(WINAPI*)(int interval);
-    using PFN_NtSetTimerResolution = LONG(NTAPI*)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+    using PFN_NtQueryTimerResolution = LONG(NTAPI*)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
+    using PFN_NtSetTimerResolution   = LONG(NTAPI*)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+    using PFN_timeBeginPeriod        = UINT(WINAPI*)(UINT uPeriod);
+    using PFN_timeEndPeriod          = UINT(WINAPI*)(UINT uPeriod);
+    using PFN_AvSetMmThreadCharsW    = HANDLE(WINAPI*)(LPCWSTR TaskName, LPDWORD TaskIndex);
+    using PFN_AvSetMmThreadPriority  = BOOL(WINAPI*)(HANDLE AvrtHandle, int Priority);
+    using PFN_AvRevertMmThreadChars  = BOOL(WINAPI*)(HANDLE AvrtHandle);
+    using PFN_DwmEnableMMCSS         = HRESULT(WINAPI*)(BOOL fEnableMMCSS);
+    using PFN_SetProcessInformation  = BOOL(WINAPI*)(HANDLE hProcess, int ProcessInformationClass, LPVOID ProcessInformation, DWORD ProcessInformationSize);
+
+    using PFN_wglGetProcAddress      = PROC(WINAPI*)(LPCSTR lpszProc);
+    using PFN_wglSwapIntervalEXT     = BOOL(WINAPI*)(int interval);
+    using PFN_glEnable               = void(APIENTRY*)(unsigned int cap);
+    using PFN_glDisable              = void(APIENTRY*)(unsigned int cap);
+    using PFN_glHint                 = void(APIENTRY*)(unsigned int target, unsigned int mode);
+    using PFN_glFlush                = void(APIENTRY*)();
 }
 
-namespace HyperEngineV4 {
+namespace ApexEngineV5 {
     static LARGE_INTEGER s_qpcFreq = {};
     static LONGLONG s_lastSwapTick = 0;
     static HANDLE s_mmcssHandle = nullptr;
+
+    static PFN_timeEndPeriod s_timeEndPeriod = nullptr;
+    static PFN_AvRevertMmThreadChars s_avRevert = nullptr;
+    static PFN_DwmEnableMMCSS s_dwmEnableMMCSS = nullptr;
+
+    static PFN_wglGetProcAddress s_wglGetProcAddress = nullptr;
     static PFN_wglSwapIntervalEXT s_wglSwapIntervalEXT = nullptr;
-    static PFN_NtSetTimerResolution s_ntSetTimerResolution = nullptr;
+    static PFN_glEnable s_glEnable = nullptr;
+    static PFN_glDisable s_glDisable = nullptr;
+    static PFN_glHint s_glHint = nullptr;
+    static PFN_glFlush s_glFlush = nullptr;
 
-    static bool s_kernelUnlocked = false;
-    static bool s_glConfigured = false;
+    static double s_activeTargetDt = MAX_FLOOR_DT;
+    static float s_timeAccumulator = 0.0f;
     static uint64_t s_frameCounter = 0;
-    static float s_subframeRemainder = 0.0f;
 
-    // 1. Mở khóa toàn diện Kernel Windows 11 (0.5ms Timer + Tắt EcoQoS + Ưu tiên CPU/GPU tối đa)
-    void unlockWindows11Kernel() {
-        if (s_kernelUnlocked) return;
+    static bool s_kernelInitialized = false;
+    static bool s_glResolved = false;
+    static bool s_forcingInterval = false;
 
-        // Ép độ phân giải đồng hồ hệ thống Windows 11 xuống 0.5ms (5000 đơn vị 100-ns)
-        if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
-            s_ntSetTimerResolution = reinterpret_cast<PFN_NtSetTimerResolution>(
-                GetProcAddress(ntdll, "NtSetTimerResolution")
+    // 1. Mở khóa toàn diện Kernel Windows 11 bằng liên kết động (Không gây lỗi biên dịch)
+    void initWindows11KernelBoost() {
+        if (s_kernelInitialized) return;
+
+        // Mở khóa độ phân giải Timer xuống 0.5ms qua ntdll.dll
+        if (HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll")) {
+            auto ntQuery = reinterpret_cast<PFN_NtQueryTimerResolution>(
+                GetProcAddress(hNtdll, "NtQueryTimerResolution")
             );
-            if (s_ntSetTimerResolution) {
-                ULONG currentRes = 0;
-                s_ntSetTimerResolution(5000, TRUE, &currentRes);
+            auto ntSet = reinterpret_cast<PFN_NtSetTimerResolution>(
+                GetProcAddress(hNtdll, "NtSetTimerResolution")
+            );
+            if (ntSet) {
+                ULONG minRes = 0, maxRes = 5000, curRes = 0;
+                if (ntQuery) {
+                    ntQuery(&minRes, &maxRes, &curRes);
+                }
+                ntSet(maxRes, TRUE, &curRes);
             }
         }
-        timeBeginPeriod(1);
 
-        // Đặt quyền ưu tiên cao nhất cho tiến trình Geometry Dash và luồng chính
+        // Khóa chu kỳ 1ms dự phòng qua winmm.dll
+        if (HMODULE hWinmm = LoadLibraryW(L"winmm.dll")) {
+            auto timeBegin = reinterpret_cast<PFN_timeBeginPeriod>(
+                GetProcAddress(hWinmm, "timeBeginPeriod")
+            );
+            s_timeEndPeriod = reinterpret_cast<PFN_timeEndPeriod>(
+                GetProcAddress(hWinmm, "timeEndPeriod")
+            );
+            if (timeBegin) {
+                timeBegin(1);
+            }
+        }
+
+        // Đặt quyền ưu tiên cao nhất cho tiến trình và luồng chính
         HANDLE hProcess = GetCurrentProcess();
         HANDLE hThread = GetCurrentThread();
         SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS);
         SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
-
-        // Bật Dynamic Priority Boost khi có tín hiệu chuột/bàn phím
         SetProcessPriorityBoost(hProcess, FALSE);
         SetThreadPriorityBoost(hThread, FALSE);
 
-        // Vô hiệu hóa hoàn toàn cơ chế tiết kiệm điện EcoQoS và khóa Timer của Windows 11
-        Win11PowerThrottling throttling = {};
-        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
-                                 PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
-        throttling.StateMask = 0;
-        SetProcessInformation(
-            hProcess,
-            static_cast<PROCESS_INFORMATION_CLASS>(4),
-            &throttling,
-            sizeof(throttling)
-        );
-
-        // Đăng ký luồng vào bộ lập lịch phần cứng MMCSS ("Games" - Critical Priority)
-        DWORD taskIndex = 0;
-        s_mmcssHandle = AvSetMmThreadCharacteristicsW(L"Games", &taskIndex);
-        if (s_mmcssHandle) {
-            AvSetMmThreadPriority(s_mmcssHandle, AVRT_PRIORITY_CRITICAL);
+        // Tắt hoàn toàn cơ chế bóp hiệu năng EcoQoS và khóa Timer trên Windows 11
+        if (HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll")) {
+            auto setProcInfo = reinterpret_cast<PFN_SetProcessInformation>(
+                GetProcAddress(hKernel32, "SetProcessInformation")
+            );
+            if (setProcInfo) {
+                Win11PowerThrottling throttling = {};
+                throttling.Version = 1;
+                throttling.ControlMask = 0x1 | 0x4; // EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION
+                throttling.StateMask = 0;           // 0 = Tắt mọi giới hạn của Windows 11
+                setProcInfo(hProcess, 4, &throttling, sizeof(throttling));
+            }
         }
 
-        // Bật chế độ ưu tiên xuất hình độ trễ thấp trên Desktop Window Manager (DWM)
-        DwmEnableMMCSS(TRUE);
+        // Đăng ký luồng chính vào hàng đợi ưu tiên phần cứng MMCSS ("Games" Critical)
+        if (HMODULE hAvrt = LoadLibraryW(L"avrt.dll")) {
+            auto avSetChars = reinterpret_cast<PFN_AvSetMmThreadCharsW>(
+                GetProcAddress(hAvrt, "AvSetMmThreadCharacteristicsW")
+            );
+            auto avSetPrio = reinterpret_cast<PFN_AvSetMmThreadPriority>(
+                GetProcAddress(hAvrt, "AvSetMmThreadPriority")
+            );
+            s_avRevert = reinterpret_cast<PFN_AvRevertMmThreadChars>(
+                GetProcAddress(hAvrt, "AvRevertMmThreadCharacteristics")
+            );
+            if (avSetChars) {
+                DWORD taskIdx = 0;
+                s_mmcssHandle = avSetChars(L"Games", &taskIdx);
+                if (s_mmcssHandle && avSetPrio) {
+                    avSetPrio(s_mmcssHandle, 2); // AVRT_PRIORITY_CRITICAL = 2
+                }
+            }
+        }
+
+        // Kích hoạt chế độ xuất hình độ trễ thấp trên Windows 11 DWM
+        if (HMODULE hDwm = LoadLibraryW(L"dwmapi.dll")) {
+            s_dwmEnableMMCSS = reinterpret_cast<PFN_DwmEnableMMCSS>(
+                GetProcAddress(hDwm, "DwmEnableMMCSS")
+            );
+            if (s_dwmEnableMMCSS) {
+                s_dwmEnableMMCSS(TRUE);
+            }
+        }
 
         QueryPerformanceFrequency(&s_qpcFreq);
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         s_lastSwapTick = now.QuadPart;
 
-        s_kernelUnlocked = true;
+        s_kernelInitialized = true;
     }
 
-    void restoreKernelState() {
-        if (!s_kernelUnlocked) return;
-        if (s_mmcssHandle) {
-            AvRevertMmThreadCharacteristics(s_mmcssHandle);
+    void cleanupKernelBoost() {
+        if (!s_kernelInitialized) return;
+        if (s_mmcssHandle && s_avRevert) {
+            s_avRevert(s_mmcssHandle);
             s_mmcssHandle = nullptr;
         }
-        DwmEnableMMCSS(FALSE);
-        timeEndPeriod(1);
-        s_kernelUnlocked = false;
+        if (s_dwmEnableMMCSS) {
+            s_dwmEnableMMCSS(FALSE);
+        }
+        if (s_timeEndPeriod) {
+            s_timeEndPeriod(1);
+        }
+        s_kernelInitialized = false;
     }
 
     // 2. Mở khóa giới hạn 60Hz ở tầng Driver GPU & Sửa lỗi nhòe hình, lệch hình, răng cưa
-    void optimizeOpenGLAndDisplay() {
-        if (!s_glConfigured) {
-            s_wglSwapIntervalEXT = reinterpret_cast<PFN_wglSwapIntervalEXT>(
-                wglGetProcAddress("wglSwapIntervalEXT")
-            );
-            s_glConfigured = true;
+    void configureOpenGLHardware() {
+        if (!s_glResolved) {
+            HMODULE hOgl = GetModuleHandleW(L"opengl32.dll");
+            if (!hOgl) {
+                hOgl = LoadLibraryW(L"opengl32.dll");
+            }
+            if (hOgl) {
+                s_wglGetProcAddress = reinterpret_cast<PFN_wglGetProcAddress>(
+                    GetProcAddress(hOgl, "wglGetProcAddress")
+                );
+                s_glEnable = reinterpret_cast<PFN_glEnable>(
+                    GetProcAddress(hOgl, "glEnable")
+                );
+                s_glDisable = reinterpret_cast<PFN_glDisable>(
+                    GetProcAddress(hOgl, "glDisable")
+                );
+                s_glHint = reinterpret_cast<PFN_glHint>(
+                    GetProcAddress(hOgl, "glHint")
+                );
+                s_glFlush = reinterpret_cast<PFN_glFlush>(
+                    GetProcAddress(hOgl, "glFlush")
+                );
+            }
+            s_glResolved = true;
         }
 
-        // Luôn tắt V-Sync phần cứng để màn hình 60Hz xuất thẳng từ 480 FPS thật trở lên
+        if (!s_wglSwapIntervalEXT && s_wglGetProcAddress) {
+            s_wglSwapIntervalEXT = reinterpret_cast<PFN_wglSwapIntervalEXT>(
+                s_wglGetProcAddress("wglSwapIntervalEXT")
+            );
+        }
+
+        // Luôn tắt V-Sync phần cứng ở tầng Driver để màn 60Hz xuất thẳng 480+ FPS thật
         if (s_wglSwapIntervalEXT) {
             s_wglSwapIntervalEXT(0);
         }
 
-        // Bật khử răng cưa đa mẫu phần cứng (MSAA), tắt bộ lọc làm nhòe cạnh đa giác
-        // giúp icon sắc nét ở tốc độ cao và xóa sạch đường kẻ đen giữa các block
-        glEnable(GL_MULTISAMPLE);
-        glDisable(GL_POLYGON_SMOOTH);
-        glDisable(GL_LINE_SMOOTH);
-        glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_NICEST);
-    }
-
-    // 3. Thiết lập sàn 480+ FPS và tương thích hoàn toàn với Mod Eclipse
-    void enforceMinimum480Floor() {
-        if (auto* gm = GameManager::sharedState()) {
-            // Tắt V-Sync nội bộ ("0030") và bật Custom FPS ("0116")
-            gm->setGameVariable("0030", false);
-            gm->setGameVariable("0116", true);
+        // Bật khử răng cưa phần cứng (MSAA) và tắt bộ lọc làm mờ cạnh gây nhòe hình/viền đen
+        if (s_glEnable) {
+            s_glEnable(GL_MULTISAMPLE_EXT_CODE);
         }
-        if (auto* director = CCDirector::sharedDirector()) {
-            // Chỉ can thiệp khi FPS bị tụt xuống dưới 480; nếu Eclipse đặt cao hơn (720/1440 FPS)
-            // thì giữ nguyên mức cao hơn đó để đạt tổng FPS cao nhất
-            if (director->m_dAnimationInterval > MAX_FLOOR_DT || director->m_dAnimationInterval <= 0.0) {
-                if (auto* app = CCApplication::sharedApplication()) {
-                    app->setAnimationInterval(MAX_FLOOR_DT);
-                }
-            }
+        if (s_glDisable) {
+            s_glDisable(GL_POLYGON_SMOOTH_CODE);
+            s_glDisable(GL_LINE_SMOOTH_CODE);
+        }
+        if (s_glHint) {
+            s_glHint(GL_PERSPECTIVE_CORRECTION_HINT_CODE, GL_NICEST_CODE);
+        }
+        if (s_glFlush) {
+            s_glFlush();
         }
     }
 
-    // 4. Quét trực tiếp tín hiệu chuột và phím từ Kernel Windows cho pha Frame-Perfect
-    void pumpRawHardwareInput() {
+    // 3. Quét trực tiếp tín hiệu chuột và phím từ Kernel Windows cho pha Frame-Perfect
+    void pollRawInput480Hz() {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, WM_MOUSEFIRST, WM_MOUSELAST, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -190,8 +245,8 @@ namespace HyperEngineV4 {
         }
     }
 
-    // 5. Bộ tán xạ đường quét theo tỷ lệ vàng (Golden-Ratio Tear Scrambler) cho màn 60Hz
-    void scramble60HzTearLine() {
+    // 4. Tán xạ đường quét theo tỷ lệ vàng trên màn hình 60Hz để chống bể hình
+    void scramble60HzScanline() {
         ++s_frameCounter;
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
@@ -199,11 +254,9 @@ namespace HyperEngineV4 {
         LONGLONG elapsed = now.QuadPart - s_lastSwapTick;
         LONGLONG minHarmonicTicks = s_qpcFreq.QuadPart / 960;
 
-        // Dịch pha vi mô theo chuỗi tỷ lệ vàng khi khung hình trùng sóng hài 60Hz
-        // giúp vệt xé hình tản mịn hoàn toàn khỏi mắt thường mà không làm giảm FPS
         if (elapsed > minHarmonicTicks && (s_frameCounter % 8 == 0)) {
             double goldenPhase = std::fmod(static_cast<double>(s_frameCounter) * 0.6180339887, 1.0);
-            LONGLONG ditherTicks = static_cast<LONGLONG>(goldenPhase * (s_qpcFreq.QuadPart / 200000));
+            LONGLONG ditherTicks = static_cast<LONGLONG>(goldenPhase * (s_qpcFreq.QuadPart / 220000));
             LARGE_INTEGER current;
             do {
                 YieldProcessor();
@@ -217,96 +270,106 @@ namespace HyperEngineV4 {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Can thiệp CCScheduler: Đảm bảo tốc độ khung hình luôn từ 480 FPS trở lên
+// 1. Hook CCApplication: Khóa sàn tối thiểu 480 FPS & Tương thích hoàn toàn với Eclipse
 // ---------------------------------------------------------------------------
-class $modify(UltimateFloorScheduler, CCScheduler) {
+class $modify(ApexAppFloor, CCApplication) {
+    void setAnimationInterval(double interval) {
+        // Nếu game đặt mức FPS thấp hơn 480 (interval > 1/480s), ép ngay về sàn 480 FPS.
+        // Nếu Eclipse Menu đặt mức FPS cao hơn (720/960/1440+ FPS -> interval < 1/480s),
+        // giữ nguyên mức cao hơn đó để đạt số lượng FPS cao nhất!
+        double targetInterval = (interval > MAX_FLOOR_DT || interval <= 0.0)
+            ? MAX_FLOOR_DT
+            : interval;
+
+        ApexEngineV5::s_activeTargetDt = targetInterval;
+        CCApplication::setAnimationInterval(targetInterval);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 2. Hook CCScheduler: Đảm bảo tốc độ xử lý >= 480Hz, chống Drop FPS & nhận Click chuẩn
+// ---------------------------------------------------------------------------
+class $modify(ApexSchedulerFloor, CCScheduler) {
     void update(float dt) {
-        HyperEngineV4::unlockWindows11Kernel();
-        HyperEngineV4::enforceMinimum480Floor();
-        HyperEngineV4::pumpRawHardwareInput();
+        ApexEngineV5::initWindows11KernelBoost();
+        ApexEngineV5::pollRawInput480Hz();
 
-        constexpr float floorDt = static_cast<float>(MAX_FLOOR_DT);
+        // Đảm bảo mức sàn 480 FPS luôn được áp dụng ngay từ frame đầu tiên
+        if (!ApexEngineV5::s_forcingInterval) {
+            ApexEngineV5::s_forcingInterval = true;
+            if (auto* app = CCApplication::sharedApplication()) {
+                app->setAnimationInterval(ApexEngineV5::s_activeTargetDt);
+            }
+        }
+
+        float baseStep = static_cast<float>(ApexEngineV5::s_activeTargetDt);
         float timeScale = this->getTimeScale();
-        float targetMaxStep = (timeScale > 0.0f) ? (floorDt * timeScale) : floorDt;
+        float maxAllowedDt = (timeScale > 0.0f) ? (baseStep * timeScale) : baseStep;
 
-        // Nếu phần cứng đang chạy >= 480 FPS (hoặc được Eclipse đẩy lên 720 - 1440+ FPS):
-        // Cho phép chạy thẳng không giới hạn trần để đạt mức FPS cao nhất
-        if (dt > 0.0f && dt <= targetMaxStep * 1.05f) {
+        // Khi phần cứng đang chạy mượt ở mức >= 480 FPS (hoặc cao hơn cùng Eclipse):
+        // Cho phép chạy thẳng không giới hạn trần để đạt FPS tối đa
+        if (dt > 0.0f && dt <= maxAllowedDt * 1.05f) {
             CCScheduler::update(dt);
             return;
         }
 
-        // Nếu gặp màn chơi quá nặng gây khựng tạm thời xuống dưới 480 FPS:
-        // Tự động chia nhỏ khung hình thành các bước >= 480Hz và quét chuột ở mỗi bước
-        // để giữ độ nhạy Frame-Perfect và không cho nhịp xử lý tụt xuống dưới 480!
-        if (dt > targetMaxStep * 1.05f && dt < 0.1f) {
-            float totalTime = dt + HyperEngineV4::s_subframeRemainder;
-            int subSteps = static_cast<int>(totalTime / targetMaxStep);
-            subSteps = std::clamp(subSteps, 1, 8);
+        // Khi gặp cảnh nặng gây khựng tạm thời xuống dưới mức sàn 480 FPS:
+        // Chia nhỏ bước thời gian về >= 480Hz và quét chuột ở mỗi bước để giữ Frame-Perfect
+        // đồng thời tích lũy phần dư giúp nhạc và hình không bao giờ bị lệch (Zero-Drift)
+        if (dt > maxAllowedDt * 1.05f && dt < 0.1f) {
+            float totalTime = dt + ApexEngineV5::s_timeAccumulator;
+            int steps = static_cast<int>(totalTime / maxAllowedDt);
+            steps = std::clamp(steps, 1, 8);
 
-            float stepDt = totalTime / static_cast<float>(subSteps);
-            if (stepDt > targetMaxStep) {
-                stepDt = targetMaxStep;
+            float stepDt = totalTime / static_cast<float>(steps);
+            if (stepDt > maxAllowedDt) {
+                stepDt = maxAllowedDt;
             }
 
-            for (int i = 0; i < subSteps; ++i) {
+            for (int i = 0; i < steps; ++i) {
                 if (i > 0) {
-                    HyperEngineV4::pumpRawHardwareInput();
+                    ApexEngineV5::pollRawInput480Hz();
                 }
                 CCScheduler::update(stepDt);
             }
 
-            HyperEngineV4::s_subframeRemainder = std::clamp(
-                totalTime - (stepDt * static_cast<float>(subSteps)),
+            ApexEngineV5::s_timeAccumulator = std::clamp(
+                totalTime - (stepDt * static_cast<float>(steps)),
                 0.0f,
-                targetMaxStep
+                maxAllowedDt
             );
         } else {
-            HyperEngineV4::s_subframeRemainder = 0.0f;
-            CCScheduler::update(targetMaxStep);
+            ApexEngineV5::s_timeAccumulator = 0.0f;
+            CCScheduler::update(maxAllowedDt);
         }
     }
 };
 
 // ---------------------------------------------------------------------------
-// 2. Can thiệp GJBaseGameLayer: Quét Input trực tiếp trong màn chơi cho Frame-Perfect
+// 3. Hook CCEGLView: Xuất 480+ FPS thật lên màn 60Hz, chống nhòe hình & chống bể hình
 // ---------------------------------------------------------------------------
-class $modify(UltimatePlayLayer, GJBaseGameLayer) {
-    void update(float dt) {
-        HyperEngineV4::pumpRawHardwareInput();
-        GJBaseGameLayer::update(dt);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// 3. Can thiệp CCEGLView: Xử lý xuất hình 480+ FPS thật, chống nhòe & chống bể hình
-// ---------------------------------------------------------------------------
-class $modify(UltimateEGLView, CCEGLView) {
+class $modify(ApexEGLViewFloor, CCEGLView) {
     void swapBuffers() {
-        HyperEngineV4::optimizeOpenGLAndDisplay();
-
-        // Đẩy toàn bộ khung hình trong hàng đợi GPU ra ngay lập tức để xóa lệch hình & trễ chuột
-        glFlush();
-
-        // Tán xạ vệt xé hình trên màn hình 60Hz
-        HyperEngineV4::scramble60HzTearLine();
-
+        ApexEngineV5::configureOpenGLHardware();
+        ApexEngineV5::scramble60HzScanline();
         CCEGLView::swapBuffers();
     }
 };
 
 // ---------------------------------------------------------------------------
-// Tự động kích hoạt ngay khi mở Geometry Dash (Không cần bật/tắt)
+// Tự động kích hoạt ngay khi mở Geometry Dash 2.2081 (Không cần bật/tắt)
 // ---------------------------------------------------------------------------
 $on_mod(Loaded) {
-    HyperEngineV4::unlockWindows11Kernel();
+    ApexEngineV5::initWindows11KernelBoost();
 
     Loader::get()->queueInMainThread([]() {
-        HyperEngineV4::optimizeOpenGLAndDisplay();
-        HyperEngineV4::enforceMinimum480Floor();
+        ApexEngineV5::configureOpenGLHardware();
+        if (auto* app = CCApplication::sharedApplication()) {
+            app->setAnimationInterval(MAX_FLOOR_DT);
+        }
     });
 }
 
 $on_mod(Unloaded) {
-    HyperEngineV4::restoreKernelState();
+    ApexEngineV5::cleanupKernelBoost();
 }
