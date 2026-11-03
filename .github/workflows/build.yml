@@ -1,31 +1,35 @@
 name: Build Geode Mod
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
+on: [push, pull_request, workflow_dispatch]
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
 
-    - name: Setup Geode CLI
-      uses: geode-sdk/install-geode-cli@v1
-      with:
-        cli-version: latest
+      - name: Auto-Sync Latest Geode SDK Version
+        shell: pwsh
+        run: |
+          try {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/geode-sdk/geode/releases/latest"
+            $latest = $release.tag_name -replace '^v',''
+            if ($latest) {
+              Write-Host "Syncing mod.json to Geode SDK version: $latest"
+              $json = Get-Content mod.json -Raw | ConvertFrom-Json
+              $json.geode = $latest
+              $json | ConvertTo-Json -Depth 10 | Set-Content mod.json -Encoding UTF8
+            }
+          } catch {
+            Write-Host "Using default Geode version from mod.json"
+          }
 
-    - name: Configure and Build Mod
-      run: |
-        geode new --name "UltraFPSBooster480" --id "dev.ultrabypass480" --developer "CustomMod" --no-interaction || true
-        geode build --config Release
+      - name: Build Geode Mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
 
-    - name: Upload Artifact (.geode file)
-      uses: actions/upload-artifact@v4
-      with:
-        name: UltraFPSBooster480
-        path: build/*.geode
+      - name: Upload Geode Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: True480PlusHyperEngine
+          path: ${{ steps.build.outputs.build-output }}
