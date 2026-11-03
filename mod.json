@@ -1,0 +1,13 @@
+{
+	"geode": "4.4.0",
+	"gd": {
+		"win": "*",
+		"android": "*",
+		"mac": "*"
+	},
+	"id": "dev.ultrabypass480",
+	"name": "Ultra FPS Booster 480+",
+	"version": "3.0.0",
+	"developer": "CustomMod",
+	"description": "v3.0: Khoa cung 480 FPS khong feedback loop, fix input latency cho Frame Perfect va tuong thich tuyet đối voi Mega Hack."
+}
